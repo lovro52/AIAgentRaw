@@ -3,6 +3,9 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 import os
 import pandas as pd
+import logging
+from flask_bcrypt import Bcrypt
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from llama_index.experimental.query_engine import PandasQueryEngine
 from prompts import new_prompt, instruction_str, context
 from note_engine import note_engine
@@ -10,10 +13,26 @@ from llama_index.core.tools import QueryEngineTool, ToolMetadata
 from llama_index.core.agent import ReActAgent
 from llama_index.llms.openai import OpenAI
 from pdf import load_pdfs, pdf_engines
-import logging
 
 # Load environment variables
 load_dotenv()
+
+app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
+bcrypt = Bcrypt(app)
+
+# Secret key for JWT
+app.config['JWT_SECRET_KEY'] = os.getenv("JWT_SECRET_KEY", "super-secret-key")
+jwt = JWTManager(app)
+
+# Mock database
+users = {}
+
+# Setup logging
+logging.basicConfig(level=logging.DEBUG)
+
+UPLOAD_FOLDER = 'uploads'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 def load_csvs(csv_paths):
     engines = {}
@@ -57,18 +76,53 @@ tools = [
 llm = OpenAI(model="gpt-3.5-turbo")
 agent = ReActAgent.from_tools(tools, llm=llm, verbose=True, context=context)
 
-# Initialize Flask app
-app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+@app.route('/api/register', methods=['POST'])
+def register():
+    data = request.get_json()
+    email = data.get('email')
+    username = data.get('username')
+    password = data.get('password')
 
-# Setup logging
-logging.basicConfig(level=logging.DEBUG)
+    if not email or not username or not password:
+        return jsonify({'error': 'Email, username, and password are required'}), 400
 
-UPLOAD_FOLDER = 'uploads'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+    if username in users:
+        return jsonify({'error': 'Username already exists'}), 400
+
+    # Hash the password before storing it
+    hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
+
+    # Save the user in the mock database
+    users[username] = {
+        'email': email,
+        'password': hashed_password
+    }
+
+    return jsonify({'message': 'User registered successfully'}), 201
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+
+    if not username or not password:
+        return jsonify({'error': 'Username and password are required'}), 400
+
+    user = users.get(username)
+    if not user or not bcrypt.check_password_hash(user['password'], password):
+        return jsonify({'error': 'Invalid credentials'}), 401
+
+    # Create a JWT token
+    access_token = create_access_token(identity=username)
+    return jsonify({'access_token': access_token}), 200
 
 @app.route('/api/ask_ai', methods=['POST'])
+@jwt_required()
 def ask_ai():
+    current_user = get_jwt_identity()
+    app.logger.debug(f"User {current_user} is making a query")
+    
     data = request.get_json()
     question = data.get('question')
     if not question:
@@ -81,7 +135,11 @@ def ask_ai():
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/upload_files', methods=['POST'])
+@jwt_required()
 def upload_files():
+    current_user = get_jwt_identity()
+    app.logger.debug(f"User {current_user} is uploading files")
+    
     if 'files' not in request.files:
         return jsonify({'error': 'No files part in the request'}), 400
 
