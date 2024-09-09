@@ -1,68 +1,110 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_bcrypt import Bcrypt
+from flask_jwt_extended import JWTManager, create_access_token
 from dotenv import load_dotenv
 import os
-import pandas as pd
-import logging
-from flask_bcrypt import Bcrypt
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+import gridfs
+from pymongo.mongo_client import MongoClient
+from pymongo.server_api import ServerApi
+from pymongo.errors import DuplicateKeyError
+from io import BytesIO
 from llama_index.experimental.query_engine import PandasQueryEngine
 from prompts import new_prompt, instruction_str, context
 from note_engine import note_engine
 from llama_index.core.tools import QueryEngineTool, ToolMetadata
 from llama_index.core.agent import ReActAgent
 from llama_index.llms.openai import OpenAI
-from pdf import load_pdfs, pdf_engines
+from pdf import get_index, PDFReader
+import logging
+import datetime
+import PyPDF2  # Added for PDF parsing
+
+# Initialize logging
+logging.basicConfig(level=logging.DEBUG)
 
 # Load environment variables
 load_dotenv()
 
+# MongoDB Atlas Configuration
+uri = "mongodb+srv://test:" + os.getenv('MONGO_PASSWORD') + "@clustertest.kimvepl.mongodb.net/?retryWrites=true&w=majority&appName=ClusterTest"
+client = MongoClient(uri, server_api=ServerApi('1'))
+
+# Connect to your database
+db = client['AI']
+fs = gridfs.GridFS(db)
+pdf_collection = db['PDFs']
+users_collection = db['users']
+
+# Initialize Flask app
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+
+# CORS Configuration
+CORS(app, supports_credentials=True, origins=["http://localhost:8080"], allow_headers=["Content-Type", "Authorization"])
+
+# Initialize Bcrypt for password hashing
 bcrypt = Bcrypt(app)
 
-# Secret key for JWT
-app.config['JWT_SECRET_KEY'] = os.getenv("JWT_SECRET_KEY", "super-secret-key")
+# Set up JWT
+app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY')  # Load from .env
 jwt = JWTManager(app)
 
-# Mock database
-users = {}
+# Ping the database to confirm connection
+try:
+    client.admin.command('ping')
+    print("Pinged your deployment. You successfully connected to MongoDB!")
+except Exception as e:
+    print(e)
 
-# Setup logging
-logging.basicConfig(level=logging.DEBUG)
+# Function to extract text from a PDF using PyPDF2
+def extract_text_from_pdf(pdf_bytes):
+    try:
+        reader = PyPDF2.PdfReader(BytesIO(pdf_bytes))
+        text = ""
+        for page in range(len(reader.pages)):
+            text += reader.pages[page].extract_text()
+        return text
+    except Exception as e:
+        logging.error(f"Error extracting text from PDF: {str(e)}")
+        return ""
 
-UPLOAD_FOLDER = 'uploads'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
-def load_csvs(csv_paths):
+# Load PDFs from GridFS and create query engines
+def load_pdfs_from_gridfs(pdf_ids):
     engines = {}
-    for csv_path in csv_paths:
-        csv_name = os.path.basename(csv_path).split('.')[0]
-        df = pd.read_csv(csv_path)
-        query_engine = PandasQueryEngine(df=df, verbose=True, instruction_str=instruction_str)
-        query_engine.update_prompts({"pandas_prompt": new_prompt})
-        engines[csv_name] = query_engine
+    for pdf_id in pdf_ids:
+        result = pdf_collection.find_one({"_id": pdf_id})
+        if result is None:
+            logging.error(f"No document found with _id {pdf_id}")
+            continue
+
+        file_name = result['filename']
+        pdf_name = os.path.splitext(file_name)[0]
+
+        # Check if the file exists in GridFS
+        if not fs.exists(pdf_id):
+            logging.error(f"File with _id {pdf_id} does not exist in GridFS")
+            continue
+
+        try:
+            pdf_bytes = fs.get(pdf_id).read()
+            pdf_text = extract_text_from_pdf(pdf_bytes)
+            index = get_index([pdf_text], pdf_name)  # Assuming the get_index function builds an index from the content
+            engines[pdf_name] = index.as_query_engine()
+        except Exception as e:
+            logging.error(f"An error occurred while processing PDF with _id {pdf_id}: {str(e)}")
     return engines
 
-# List of CSV files
-csv_paths = [os.path.join("data", "population.csv"), os.path.join("data", "movies.csv")]
-csv_engines = load_csvs(csv_paths)
+# Initialize data and query engines with existing files
+pdf_files = list(pdf_collection.find({"type": "pdf"}))
+pdf_ids = [file['_id'] for file in pdf_files]
+
+pdf_engines = load_pdfs_from_gridfs(pdf_ids)
 
 tools = [
     note_engine,
     *[
         QueryEngineTool(
             query_engine=engine,
-            metadata=ToolMetadata(
-                name=f"{name}_data",
-                description=f"This gives information about {name} data",
-            ),
-        )
-        for name, engine in csv_engines.items()
-    ],
-    *[
-        QueryEngineTool(
-            query_engine=engine.as_query_engine(),
             metadata=ToolMetadata(
                 name=f"{name}_data",
                 description=f"This gives detailed information about {name} the document",
@@ -76,6 +118,9 @@ tools = [
 llm = OpenAI(model="gpt-3.5-turbo")
 agent = ReActAgent.from_tools(tools, llm=llm, verbose=True, context=context)
 
+# Flask routes
+
+# Register route
 @app.route('/api/register', methods=['POST'])
 def register():
     data = request.get_json()
@@ -84,22 +129,24 @@ def register():
     password = data.get('password')
 
     if not email or not username or not password:
-        return jsonify({'error': 'Email, username, and password are required'}), 400
+        return jsonify({'error': 'Missing fields'}), 400
 
-    if username in users:
-        return jsonify({'error': 'Username already exists'}), 400
-
-    # Hash the password before storing it
     hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
 
-    # Save the user in the mock database
-    users[username] = {
-        'email': email,
-        'password': hashed_password
-    }
+    try:
+        users_collection.insert_one({
+            'email': email,
+            'username': username,
+            'password': hashed_password
+        })
+        return jsonify({'message': 'User registered successfully'}), 201
+    except DuplicateKeyError:
+        return jsonify({'error': 'User already exists'}), 400
+    except Exception as e:
+        logging.error(f"Error registering user: {str(e)}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
-    return jsonify({'message': 'User registered successfully'}), 201
-
+# Login route
 @app.route('/api/login', methods=['POST'])
 def login():
     data = request.get_json()
@@ -107,22 +154,20 @@ def login():
     password = data.get('password')
 
     if not username or not password:
-        return jsonify({'error': 'Username and password are required'}), 400
+        return jsonify({'error': 'Missing fields'}), 400
 
-    user = users.get(username)
-    if not user or not bcrypt.check_password_hash(user['password'], password):
+    user = users_collection.find_one({'username': username})
+
+    if user and bcrypt.check_password_hash(user['password'], password):
+        access_token = create_access_token(identity={'username': username, 'email': user['email']}, 
+                                           expires_delta=datetime.timedelta(hours=1))
+        return jsonify({'access_token': access_token}), 200
+    else:
         return jsonify({'error': 'Invalid credentials'}), 401
 
-    # Create a JWT token
-    access_token = create_access_token(identity=username)
-    return jsonify({'access_token': access_token}), 200
-
+# Ask AI route
 @app.route('/api/ask_ai', methods=['POST'])
-@jwt_required()
 def ask_ai():
-    current_user = get_jwt_identity()
-    app.logger.debug(f"User {current_user} is making a query")
-    
     data = request.get_json()
     question = data.get('question')
     if not question:
@@ -131,107 +176,31 @@ def ask_ai():
         result = agent.query(question)
         return jsonify({'answer': str(result)})  # Ensure result is converted to string
     except Exception as e:
-        app.logger.error(f"Error processing the request: {str(e)}", exc_info=True)
+        logging.error(f"Error processing the request: {str(e)}", exc_info=True)
         return jsonify({'error': str(e)}), 500
 
+# Upload files route
 @app.route('/api/upload_files', methods=['POST'])
-@jwt_required()
 def upload_files():
-    current_user = get_jwt_identity()
-    app.logger.debug(f"User {current_user} is uploading files")
-    
     if 'files' not in request.files:
         return jsonify({'error': 'No files part in the request'}), 400
 
     files = request.files.getlist('files')
     for file in files:
         if file:
-            filename = file.filename
-            file_path = os.path.join(UPLOAD_FOLDER, filename)
-            file.save(file_path)
-            
-            # Update engines if the file is a CSV or PDF
-            if filename.endswith('.csv'):
-                csv_engines.update(load_csvs([file_path]))
-            elif filename.endswith('.pdf'):
-                pdf_engines.update(load_pdfs([file_path]))
+            file_id = fs.put(file, filename=file.filename)
+            # Store file metadata in MongoDB
+            file_metadata = {
+                "filename": file.filename,
+                "file_id": file_id,
+                "type": "pdf"  # Assuming we are handling only PDFs for this task
+            }
+            pdf_collection.insert_one(file_metadata)
+
+            # Update engines with the new file content
+            pdf_engines.update(load_pdfs_from_gridfs([file_id]))
 
     return jsonify({'message': 'Files uploaded successfully'}), 200
 
 if __name__ == '__main__':
     app.run(debug=True)
-
-
-
-""" from flask import Flask, request, jsonify
-from flask_cors import CORS
-from dotenv import load_dotenv
-import os
-import pandas as pd
-from llama_index.experimental.query_engine import PandasQueryEngine
-from prompts import new_prompt, instruction_str, context
-from note_engine import note_engine
-from llama_index.core.tools import QueryEngineTool, ToolMetadata
-from llama_index.core.agent import ReActAgent
-from llama_index.llms.openai import OpenAI
-from pdf import canada_engine
-import logging
-
-# Load environment variables
-load_dotenv()
-
-# Initialize data and query engines
-population_path = os.path.join("data", "population.csv")
-population_df = pd.read_csv(population_path)
-
-population_query_engine = PandasQueryEngine(
-    df=population_df, verbose=True, instruction_str=instruction_str
-)
-population_query_engine.update_prompts({"pandas_prompt": new_prompt})
-
-# Define tools
-tools = [
-    note_engine,
-    QueryEngineTool(
-        query_engine=population_query_engine,
-        metadata=ToolMetadata(
-            name="population_data",
-            description="This gives information about the world population and demographics",
-        ),
-    ),
-    QueryEngineTool(
-        query_engine=canada_engine,
-        metadata=ToolMetadata(
-            name="canada_data",
-            description="This gives detailed information about Canada the country",
-        ),
-    ),
-]
-
-# Initialize LLM and agent
-llm = OpenAI(model="gpt-3.5-turbo")
-agent = ReActAgent.from_tools(tools, llm=llm, verbose=True, context=context)
-
-# Initialize Flask app
-app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
-
-# Setup logging
-logging.basicConfig(level=logging.DEBUG)
-
-@app.route('/api/ask_ai', methods=['POST'])
-def ask_ai():
-    data = request.get_json()
-    question = data.get('question')
-    if not question:
-        return jsonify({'error': 'Question is required'}), 400
-    try:
-        result = agent.query(question)
-        return jsonify({'answer': str(result)})  # Ensure result is converted to string
-    except Exception as e:
-        app.logger.error(f"Error processing the request: {str(e)}", exc_info=True)
-        return jsonify({'error': str(e)}), 500
-
-if __name__ == '__main__':
-    app.run(debug=True)
- """
